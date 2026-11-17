@@ -1,0 +1,7 @@
+log:
+  level: info
+  format: text
+
+timezone: Europe/Moscow
+shutdown_timeout: 10s
+heartbeat_interval: 30s

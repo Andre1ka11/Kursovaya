@@ -1,0 +1,38 @@
+{
+  "version": "2.0.0",
+  "options": {
+    "cwd": "${workspaceFolder}"
+  },
+  "tasks": [
+    {
+      "label": "Agent: run",
+      "type": "process",
+      "command": "go",
+      "args": ["run", "./cmd/agent"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Agent: check config",
+      "type": "process",
+      "command": "go",
+      "args": ["run", "./cmd/agent", "-check-config"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Agent: build",
+      "type": "process",
+      "command": "go",
+      "args": ["build", "-o", "bin/agent.exe", "./cmd/agent"],
+      "group": {"kind": "build", "isDefault": true},
+      "problemMatcher": []
+    },
+    {
+      "label": "Agent: test",
+      "type": "process",
+      "command": "go",
+      "args": ["test", "./..."],
+      "group": "test",
+      "problemMatcher": []
+    }
+  ]
+}
