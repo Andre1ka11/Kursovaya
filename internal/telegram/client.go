@@ -15,13 +15,13 @@ import (
 	"github.com/go-telegram/bot/models"
 
 	"study-agent/internal/config"
+	"study-agent/internal/service"
 )
 
 const requestTimeout = 10 * time.Second
 
 type CommandService interface {
-	Start() string
-	Help() string
+	Handle(context.Context, service.Request) (service.Response, error)
 }
 
 type Client struct {
@@ -52,7 +52,7 @@ func newClient(cfg config.Telegram, commands CommandService, logger *slog.Logger
 	options := []tgbot.Option{
 		tgbot.WithSkipGetMe(), // Initialization belongs to Run and its cancellable context.
 		tgbot.WithHTTPClient(30*time.Second, &http.Client{Timeout: 40 * time.Second}),
-		tgbot.WithAllowedUpdates(tgbot.AllowedUpdates{"message"}),
+		tgbot.WithAllowedUpdates(tgbot.AllowedUpdates{"message", "callback_query"}),
 		tgbot.WithDefaultHandler(c.handle),
 		tgbot.WithErrorsHandler(c.handleError),
 		tgbot.WithNotAsyncHandlers(), // Start waits for the active handler during shutdown.
@@ -87,6 +87,13 @@ func (c *Client) Run(ctx context.Context) error {
 	_, err = c.bot.SetMyCommands(initCtx, &tgbot.SetMyCommandsParams{Commands: []models.BotCommand{
 		{Command: "start", Description: "Знакомство с помощником"},
 		{Command: "help", Description: "Доступные команды"},
+		{Command: "add", Description: "Добавить задачу"},
+		{Command: "cancel", Description: "Отменить добавление"},
+		{Command: "tasks", Description: "Список задач"},
+		{Command: "today", Description: "Задачи на сегодня"},
+		{Command: "week", Description: "Задачи на ближайшие 7 дней"},
+		{Command: "done", Description: "Завершить задачу по ID"},
+		{Command: "delete", Description: "Удалить задачу по ID"},
 	}})
 	if err != nil {
 		return startupError(ctx, "setMyCommands", err)
@@ -117,7 +124,14 @@ func (c *Client) Run(ctx context.Context) error {
 }
 
 func (c *Client) handle(ctx context.Context, b *tgbot.Bot, update *models.Update) {
-	if update == nil || update.Message == nil {
+	if update == nil {
+		return
+	}
+	if update.CallbackQuery != nil {
+		c.handleCallback(ctx, b, update.CallbackQuery)
+		return
+	}
+	if update.Message == nil {
 		return
 	}
 	m := update.Message
@@ -129,42 +143,139 @@ func (c *Client) handle(ctx context.Context, b *tgbot.Bot, update *models.Update
 		c.reply(ctx, b, m.Chat.ID, "Доступ к этому боту ограничен владельцем.")
 		return
 	}
-	fields := strings.Fields(m.Text)
+	text := strings.TrimSpace(m.Text)
+	fields := strings.Fields(text)
+	if len(fields) > 0 && strings.HasPrefix(fields[0], "/") {
+		command, target, addressed := strings.Cut(fields[0], "@")
+		if addressed && !strings.EqualFold(target, c.username) {
+			return
+		}
+		if addressed {
+			text = command + strings.TrimPrefix(text, fields[0])
+		}
+	}
+	c.dispatch(ctx, b, m.Chat.ID, 0, service.Request{UserID: m.From.ID, Text: text})
+}
+
+func (c *Client) handleCallback(ctx context.Context, b *tgbot.Bot, q *models.CallbackQuery) {
+	if q.From.IsBot || !c.allowed[q.From.ID] {
+		c.answerCallback(ctx, b, q.ID, "Доступ к этому боту ограничен владельцем.")
+		return
+	}
+	m := q.Message.Message
+	if m == nil || m.Chat.Type != models.ChatTypePrivate || m.Chat.ID != q.From.ID {
+		c.answerCallback(ctx, b, q.ID, "Открой свежий список в личном чате: /tasks")
+		return
+	}
+	if !c.answerCallback(ctx, b, q.ID, "") {
+		return
+	}
+	c.dispatch(ctx, b, m.Chat.ID, m.ID, service.Request{UserID: q.From.ID, CallbackData: q.Data})
+}
+
+func (c *Client) answerCallback(ctx context.Context, b *tgbot.Bot, id, text string) bool {
+	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	_, err := b.AnswerCallbackQuery(requestCtx, &tgbot.AnswerCallbackQueryParams{CallbackQueryID: id, Text: text, ShowAlert: text != ""})
+	if err != nil {
+		c.handleAPIError("answerCallbackQuery", err)
+		return false
+	}
+	return true
+}
+
+func (c *Client) dispatch(ctx context.Context, b *tgbot.Bot, chatID int64, messageID int, r service.Request) {
+	started := time.Now()
+	logger := c.logger.With("user_id", r.UserID, "action", logAction(r))
+	logger.Info("telegram message received")
+	result := "ok"
+	out, err := c.commands.Handle(ctx, r)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		logger.Warn("task command failed")
+		result = "service_error"
+		out = service.Response{Text: "Не удалось выполнить действие. Попробуй ещё раз. Незавершённое добавление можно отменить: /cancel"}
+	}
+	if c.respond(ctx, b, chatID, messageID, out) {
+		logger.Info("telegram reply sent", "result", result, "duration_ms", time.Since(started).Milliseconds())
+	} else if ctx.Err() == nil {
+		logger.Warn("telegram reply failed", "duration_ms", time.Since(started).Milliseconds())
+	}
+}
+
+// Action labels are fixed: command arguments, callback payloads and task text stay out of logs.
+func logAction(r service.Request) string {
+	if r.CallbackData != "" {
+		action, _, _ := strings.Cut(r.CallbackData, ":")
+		switch action {
+		case "list", "task", "done", "delete", "confirm":
+			return "button_" + action
+		}
+		return "button_unknown"
+	}
+	fields := strings.Fields(r.Text)
 	if len(fields) == 0 {
-		c.reply(ctx, b, m.Chat.ID, "Отправь /help, чтобы увидеть доступные команды.")
-		return
+		return "attachment_or_empty"
 	}
-	command, target, addressed := strings.Cut(fields[0], "@")
-	if addressed && !strings.EqualFold(target, c.username) {
-		return
+	switch fields[0] {
+	case "/start", "/help", "/add", "/cancel", "/tasks", "/today", "/week", "/done", "/delete":
+		return fields[0]
 	}
-	var answer string
-	switch command {
-	case "/start":
-		answer = c.commands.Start()
-	case "/help":
-		answer = c.commands.Help()
-	default:
-		answer = "Неизвестная команда. Доступны /start и /help."
+	if strings.HasPrefix(fields[0], "/") {
+		return "unknown_command"
 	}
-	c.reply(ctx, b, m.Chat.ID, answer)
+	return "text"
+}
+
+func (c *Client) respond(ctx context.Context, b *tgbot.Bot, chatID int64, messageID int, out service.Response) bool {
+	keyboard := models.InlineKeyboardMarkup{InlineKeyboard: make([][]models.InlineKeyboardButton, 0, len(out.Buttons))}
+	for _, row := range out.Buttons {
+		buttons := make([]models.InlineKeyboardButton, 0, len(row))
+		for _, button := range row {
+			buttons = append(buttons, models.InlineKeyboardButton{Text: button.Text, CallbackData: button.Data})
+		}
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, buttons)
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	if messageID != 0 {
+		_, err := b.EditMessageText(requestCtx, &tgbot.EditMessageTextParams{ChatID: chatID, MessageID: messageID, Text: out.Text, ReplyMarkup: keyboard})
+		if err == nil || (errors.Is(err, tgbot.ErrorBadRequest) && strings.Contains(err.Error(), "message is not modified")) {
+			return true
+		}
+		c.handleAPIError("editMessageText", err)
+		if !errors.Is(err, tgbot.ErrorBadRequest) {
+			return false
+		}
+	}
+	if _, err := b.SendMessage(requestCtx, &tgbot.SendMessageParams{ChatID: chatID, Text: out.Text, ReplyMarkup: keyboard}); err != nil {
+		c.handleAPIError("sendMessage", err)
+		return false
+	}
+	return true
 }
 
 func (c *Client) reply(ctx context.Context, b *tgbot.Bot, chatID int64, text string) {
 	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	if _, err := b.SendMessage(requestCtx, &tgbot.SendMessageParams{ChatID: chatID, Text: text}); err != nil {
-		c.handleError(err)
+		c.handleAPIError("sendMessage", err)
 	}
 }
 
 func (c *Client) handleError(err error) {
+	c.handleAPIError("getUpdates", err)
+}
+
+func (c *Client) handleAPIError(operation string, err error) {
 	if errors.Is(err, context.Canceled) {
 		return
 	}
 	// SDK errors can contain request URLs or incoming text. Log only a safe category.
 	category := errorCategory(err)
-	c.logger.Warn("telegram request failed", "category", category)
+	c.logger.Warn("telegram request failed", "operation", operation, "category", category)
 	if errors.Is(err, tgbot.ErrorUnauthorized) || errors.Is(err, tgbot.ErrorConflict) {
 		select {
 		case c.fatal <- fmt.Errorf("Telegram polling failed: %s", category):

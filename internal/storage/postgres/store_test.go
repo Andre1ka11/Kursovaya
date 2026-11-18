@@ -15,6 +15,7 @@ import (
 
 	"study-agent/internal/config"
 	"study-agent/internal/domain"
+	"study-agent/internal/service"
 )
 
 func TestErrorsHideSecrets(t *testing.T) {
@@ -57,6 +58,86 @@ func TestPostgresIntegration(t *testing.T) {
 		})
 		return owner
 	}
+
+	t.Run("DeadlineBoundsAndPagination", func(t *testing.T) {
+		owner := newOwner(t)
+		from := time.Date(2026, 11, 18, 21, 0, 0, 0, time.UTC)
+		before := from.AddDate(0, 0, 1)
+		previous := from.Add(-time.Microsecond)
+		last := before.Add(-time.Microsecond)
+		var ids []int64
+		for _, due := range []*time.Time{&previous, &from, &last, &before, nil} {
+			task, err := s.CreateTask(ctx, domain.Task{OwnerID: owner, Title: "Boundary", DueAt: due})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids = append(ids, task.ID)
+		}
+		filter := domain.TaskFilter{Status: domain.TaskTodo, DueFrom: &from, DueBefore: &before, Limit: 10}
+		tasks, err := s.FindTasks(ctx, owner, filter)
+		if err != nil || len(tasks) != 2 || tasks[0].ID != ids[1] || tasks[1].ID != ids[2] {
+			t.Fatalf("deadline range must be [from,before): %+v %v", tasks, err)
+		}
+		filter.Limit = 1
+		filter.Offset = 1
+		tasks, err = s.FindTasks(ctx, owner, filter)
+		if err != nil || len(tasks) != 1 || tasks[0].ID != ids[2] {
+			t.Fatalf("pagination failed: %v", err)
+		}
+	})
+
+	t.Run("TaskCommandLifecycleWithPostgreSQL", func(t *testing.T) {
+		owner := newOwner(t)
+		zone, _ := time.LoadLocation("Europe/Moscow")
+		commands := service.NewCommands(s, zone)
+		due := time.Now().In(zone).Format("02.01.2006") + " 18:00"
+		handle := func(text, data string) service.Response {
+			t.Helper()
+			out, err := commands.Handle(ctx, service.Request{UserID: owner, Text: text, CallbackData: data})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return out
+		}
+		var card service.Response
+		for _, text := range []string{"/add", "Проверка этапа 4", "Базы данных", due, "Проверить полный цикл"} {
+			card = handle(text, "")
+		}
+		tasks, err := s.FindTasks(ctx, owner, domain.TaskFilter{Status: domain.TaskTodo, Limit: 10})
+		if err != nil || len(tasks) != 1 {
+			t.Fatalf("dialog did not persist task: %v", err)
+		}
+		task := tasks[0]
+		reminder, err := s.CreateReminder(ctx, domain.Reminder{OwnerID: owner, TaskID: &task.ID, RemindAt: time.Now().Add(time.Hour)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A new service has no dialog state; the saved task must still be visible.
+		commands = service.NewCommands(s, zone)
+		for _, text := range []string{"/tasks", "/today", "/week"} {
+			if out := handle(text, ""); !strings.Contains(out.Text, "Проверка этапа 4") {
+				t.Fatalf("saved task missing from %s", text)
+			}
+		}
+		if out := handle("", card.Buttons[0][0].Data); !strings.Contains(out.Text, "выполнена") {
+			t.Fatal("completion callback failed")
+		}
+		reminder, err = s.Reminder(ctx, owner, reminder.ID)
+		if err != nil || reminder.Status != "canceled" {
+			t.Fatalf("completion left a pending reminder: %v", err)
+		}
+		if out := handle("/tasks done", ""); !strings.Contains(out.Text, "Проверка этапа 4") {
+			t.Fatal("completed task missing")
+		}
+		confirmation := handle(fmt.Sprintf("/delete %d", task.ID), "")
+		if _, err := s.Task(ctx, owner, task.ID); err != nil {
+			t.Fatal("task deleted before confirmation")
+		}
+		handle("", confirmation.Buttons[0][0].Data)
+		if _, err := s.Task(ctx, owner, task.ID); !errors.Is(err, ErrNotFound) {
+			t.Fatal("confirmed deletion failed")
+		}
+	})
 
 	t.Run("MigrationsAreRepeatableAndSerialized", func(t *testing.T) {
 		results := make(chan error, 2)

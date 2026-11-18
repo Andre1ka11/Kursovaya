@@ -19,6 +19,12 @@ type Task struct {
 	CreatedAt, UpdatedAt              time.Time
 }
 
+type TaskFilter struct {
+	Status             TaskStatus
+	DueFrom, DueBefore *time.Time
+	Limit, Offset      int
+}
+
 type Lesson struct {
 	ID, OwnerID                       int64
 	Source, SourceID, Title, Location string

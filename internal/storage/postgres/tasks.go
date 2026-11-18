@@ -30,14 +30,21 @@ func (s *Store) Task(ctx context.Context, ownerID, id int64) (domain.Task, error
 
 // Tasks is bounded and ordered by deadline, with undated tasks at the end.
 func (s *Store) Tasks(ctx context.Context, ownerID int64, status domain.TaskStatus, limit, offset int) ([]domain.Task, error) {
-	if limit < 1 || limit > 100 || offset < 0 {
+	return s.FindTasks(ctx, ownerID, domain.TaskFilter{Status: status, Limit: limit, Offset: offset})
+}
+
+func (s *Store) FindTasks(ctx context.Context, ownerID int64, f domain.TaskFilter) ([]domain.Task, error) {
+	if f.Limit < 1 || f.Limit > 100 || f.Offset < 0 {
 		return nil, errors.New("task list requires limit 1..100 and nonnegative offset")
 	}
-	if status != "" && status != domain.TaskTodo && status != domain.TaskDone {
+	if f.Status != "" && f.Status != domain.TaskTodo && f.Status != domain.TaskDone {
 		return nil, ErrInvalid
 	}
 	rows, err := s.db.Query(ctx, "SELECT "+taskColumns+` FROM study_agent.tasks
-WHERE owner_id=$1 AND ($2='' OR status=$2) ORDER BY due_at NULLS LAST, id LIMIT $3 OFFSET $4`, ownerID, string(status), limit, offset)
+WHERE owner_id=$1 AND ($2='' OR status=$2)
+AND ($3::timestamptz IS NULL OR due_at >= $3)
+AND ($4::timestamptz IS NULL OR due_at < $4)
+ORDER BY due_at NULLS LAST, id LIMIT $5 OFFSET $6`, ownerID, string(f.Status), f.DueFrom, f.DueBefore, f.Limit, f.Offset)
 	if err != nil {
 		return nil, dbError(err)
 	}
@@ -54,9 +61,12 @@ WHERE owner_id=$1 AND ($2='' OR status=$2) ORDER BY due_at NULLS LAST, id LIMIT 
 }
 
 func (s *Store) CompleteTask(ctx context.Context, ownerID, id int64) (domain.Task, error) {
-	return scanTask(s.db.QueryRow(ctx, `UPDATE study_agent.tasks
+	return scanTask(s.db.QueryRow(ctx, `WITH completed AS (UPDATE study_agent.tasks
 SET status='done', completed_at=COALESCE(completed_at,now()), updated_at=now()
-WHERE owner_id=$1 AND id=$2 RETURNING `+taskColumns, ownerID, id))
+WHERE owner_id=$1 AND id=$2 RETURNING `+taskColumns+`), canceled AS (
+UPDATE study_agent.reminders SET status='canceled'
+WHERE owner_id=$1 AND task_id IN (SELECT id FROM completed) AND status='pending'
+) SELECT `+taskColumns+` FROM completed`, ownerID, id))
 }
 
 func (s *Store) DeleteTask(ctx context.Context, ownerID, id int64) error {

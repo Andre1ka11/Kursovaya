@@ -20,6 +20,7 @@ import (
 	"github.com/go-telegram/bot/models"
 
 	"study-agent/internal/config"
+	"study-agent/internal/service"
 )
 
 const fakeToken = "123:fake-token"
@@ -29,22 +30,43 @@ type testCommands struct{ start, help atomic.Int32 }
 func (c *testCommands) Start() string { c.start.Add(1); return "start-response" }
 func (c *testCommands) Help() string  { c.help.Add(1); return "help-response" }
 
+func (c *testCommands) Handle(_ context.Context, r service.Request) (service.Response, error) {
+	switch r.Text {
+	case "/start":
+		return service.Response{Text: c.Start()}, nil
+	case "/help":
+		return service.Response{Text: c.Help()}, nil
+	case "":
+		if r.CallbackData != "" {
+			c.help.Add(1)
+			return service.Response{Text: "callback-response", Buttons: [][]service.Button{{{Text: "К списку", Data: "list:tasks:todo:0"}}}}, nil
+		}
+		return service.Response{Text: "Отправь /help"}, nil
+	default:
+		return service.Response{Text: "Неизвестная команда"}, nil
+	}
+}
+
 type sentMessage struct {
-	chatID int64
-	text   string
+	chatID   int64
+	text     string
+	method   string
+	keyboard models.InlineKeyboardMarkup
 }
 
 type fakeAPI struct {
-	updates    []*models.Update
-	failMethod string
-	failCode   int
-	webhook    string
-	blockSend  bool
-	sent       chan sentMessage
-	sending    chan struct{}
-	sendOnce   sync.Once
-	polls      atomic.Int32
-	menus      atomic.Int32
+	updates          []*models.Update
+	failMethod       string
+	failCode         int
+	webhook          string
+	blockSend        bool
+	sent             chan sentMessage
+	sending          chan struct{}
+	sendOnce         sync.Once
+	polls            atomic.Int32
+	menus            atomic.Int32
+	answers          atomic.Int32
+	callbacksAllowed atomic.Bool
 }
 
 func (a *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
@@ -77,6 +99,9 @@ func (a *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 		a.menus.Add(1)
 		result = true
 	case "getUpdates":
+		if strings.Contains(r.FormValue("allowed_updates"), "callback_query") {
+			a.callbacksAllowed.Store(true)
+		}
 		if a.polls.Add(1) == 1 {
 			result = a.updates
 			if result == nil || len(a.updates) == 0 {
@@ -86,14 +111,19 @@ func (a *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 			<-r.Context().Done()
 			return
 		}
-	case "sendMessage":
+	case "answerCallbackQuery":
+		a.answers.Add(1)
+		result = true
+	case "sendMessage", "editMessageText":
 		if a.blockSend {
 			a.sendOnce.Do(func() { close(a.sending) })
 			<-r.Context().Done()
 			return
 		}
 		id, _ := strconv.ParseInt(r.FormValue("chat_id"), 10, 64)
-		a.sent <- sentMessage{id, r.FormValue("text")}
+		var keyboard models.InlineKeyboardMarkup
+		_ = json.Unmarshal([]byte(r.FormValue("reply_markup")), &keyboard)
+		a.sent <- sentMessage{chatID: id, text: r.FormValue("text"), method: method, keyboard: keyboard}
 		result = models.Message{ID: 1}
 	default:
 		http.Error(w, "unexpected method", http.StatusNotFound)
@@ -109,7 +139,7 @@ func update(id int64, userID int64, text string) *models.Update {
 	}}
 }
 
-func testClient(t *testing.T, api *fakeAPI, commands *testCommands, out io.Writer) *Client {
+func testClient(t *testing.T, api *fakeAPI, commands CommandService, out io.Writer) *Client {
 	t.Helper()
 	api.sent = make(chan sentMessage, 20)
 	api.sending = make(chan struct{})
@@ -234,6 +264,65 @@ func TestShutdownCancelsInFlightReply(t *testing.T) {
 	case <-api.sending:
 	case <-time.After(5 * time.Second):
 		t.Fatal("reply did not start")
+	}
+	cancel()
+	if err := awaitStop(t, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func callbackUpdate(id int64, owner int64, data string) *models.Update {
+	return &models.Update{ID: id, CallbackQuery: &models.CallbackQuery{
+		ID: strconv.FormatInt(id, 10), From: models.User{ID: owner}, Data: data,
+		Message: models.MaybeInaccessibleMessage{Message: &models.Message{ID: 10, Date: 1, Chat: models.Chat{ID: owner, Type: models.ChatTypePrivate}}},
+	}}
+}
+
+func TestCallbacksAreAuthorizedAcknowledgedAndEditCards(t *testing.T) {
+	denied := callbackUpdate(1, 99, "done:1:tasks:todo:0")
+	group := callbackUpdate(2, 42, "done:1:tasks:todo:0")
+	group.CallbackQuery.Message.Message.Chat.Type = models.ChatTypeGroup
+	old := callbackUpdate(3, 42, "done:1:tasks:todo:0")
+	old.CallbackQuery.Message = models.MaybeInaccessibleMessage{Type: models.MaybeInaccessibleMessageTypeInaccessibleMessage, InaccessibleMessage: &models.InaccessibleMessage{Chat: models.Chat{ID: 42, Type: models.ChatTypePrivate}, MessageID: 10}}
+	valid := callbackUpdate(4, 42, "task:1:tasks:todo:0")
+	api := &fakeAPI{updates: []*models.Update{denied, group, old, valid}}
+	commands := &testCommands{}
+	c := testClient(t, api, commands, io.Discard)
+	cancel, done := startClient(t, c)
+	select {
+	case m := <-api.sent:
+		if m.method != "editMessageText" || m.text != "callback-response" || len(m.keyboard.InlineKeyboard) != 1 || m.keyboard.InlineKeyboard[0][0].CallbackData != "list:tasks:todo:0" {
+			t.Fatalf("callback response was not rendered: %+v", m)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("callback reply missing")
+	}
+	cancel()
+	if err := awaitStop(t, done); err != nil {
+		t.Fatal(err)
+	}
+	if commands.help.Load() != 1 || api.answers.Load() != 4 || !api.callbacksAllowed.Load() {
+		t.Fatal("callback authorization, acknowledgment or subscription failed")
+	}
+}
+
+func TestHelpAndDisabledStorageThroughTelegramAPI(t *testing.T) {
+	// A nil repository still allows /help and demonstrates the real service transport.
+	api := &fakeAPI{updates: []*models.Update{update(1, 42, "/help"), update(2, 42, "/help@study_agent_bot"), update(3, 42, "/add")}}
+	c := testClient(t, api, service.NewCommands(nil, time.UTC), io.Discard)
+	cancel, done := startClient(t, c)
+	for i := 0; i < 3; i++ {
+		select {
+		case m := <-api.sent:
+			if i < 2 && (!strings.Contains(m.text, "/tasks") || !strings.Contains(m.text, "/cancel") || !strings.Contains(m.text, "/add") || !strings.Contains(m.text, "/delete")) {
+				t.Fatal("task help was not sent")
+			}
+			if i == 2 && !strings.Contains(m.text, "недоступны") {
+				t.Fatal("disabled storage was not handled")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("service reply missing")
+		}
 	}
 	cancel()
 	if err := awaitStop(t, done); err != nil {

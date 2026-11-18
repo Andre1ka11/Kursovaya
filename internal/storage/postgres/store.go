@@ -12,12 +12,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"study-agent/internal/config"
+	"study-agent/internal/domain"
 )
 
 var (
-	ErrNotFound = errors.New("record not found")
-	ErrConflict = errors.New("record already exists")
-	ErrInvalid  = errors.New("invalid record or reference")
+	ErrNotFound = domain.ErrNotFound
+	ErrConflict = domain.ErrConflict
+	ErrInvalid  = domain.ErrInvalid
 )
 
 type querier interface {

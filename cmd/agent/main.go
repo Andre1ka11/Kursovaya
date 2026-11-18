@@ -63,6 +63,7 @@ func run() (exitCode int) {
 		logger.Error("database is disabled; set AGENT_DATABASE_ENABLED=true")
 		return 1
 	}
+	var tasks service.TaskRepository
 	if cfg.Database.Enabled {
 		db, err := postgres.Open(ctx, cfg.Database)
 		if err != nil {
@@ -83,6 +84,7 @@ func run() (exitCode int) {
 			}
 		}()
 		logger.Info("database connected")
+		tasks = db
 		if *checkDB {
 			return 0
 		}
@@ -104,7 +106,7 @@ func run() (exitCode int) {
 
 	var workers []app.Worker
 	if cfg.Telegram.Enabled {
-		client, err := telegram.New(cfg.Telegram, service.Commands{}, logger)
+		client, err := telegram.New(cfg.Telegram, service.NewCommands(tasks, cfg.Timezone), logger)
 		if err != nil {
 			logger.Error("cannot initialize Telegram bot", "error", err)
 			return 1
