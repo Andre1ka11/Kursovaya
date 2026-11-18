@@ -150,6 +150,54 @@ func TestTelegramRejectsInvalidSettings(t *testing.T) {
 	}
 }
 
+func TestDatabaseSettings(t *testing.T) {
+	path := writeFile(t, "agent.yaml", validYAML)
+	env := writeFile(t, ".env", "AGENT_DATABASE_ENABLED=true\nAGENT_DATABASE_PASSWORD='literal:# password'\nAGENT_DATABASE_PORT=5440\n")
+	cfg, err := load(path, env, environment(map[string]string{"AGENT_DATABASE_PORT": "5432"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Database.Enabled || cfg.Database.Port != 5432 || cfg.Database.Password != "literal:# password" || cfg.Database.User != "study_agent" {
+		t.Fatal("database defaults or environment precedence are incorrect")
+	}
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), cfg.Database.Password) {
+		t.Fatal("database password was serialized")
+	}
+}
+
+func TestDatabaseRejectsInvalidSettings(t *testing.T) {
+	for _, tc := range []struct{ key, value, want string }{
+		{"AGENT_DATABASE_PASSWORD", "", "PASSWORD"},
+		{"AGENT_DATABASE_ENABLED", "maybe", "true or false"},
+		{"AGENT_DATABASE_PORT", "0", "port"},
+		{"AGENT_DATABASE_PORT", "65536", "port"},
+		{"AGENT_DATABASE_PORT", "do-not-print-this", "PORT"},
+		{"AGENT_DATABASE_HOST", "", "host"},
+		{"AGENT_DATABASE_NAME", "", "name"},
+		{"AGENT_DATABASE_USER", "", "user"},
+		{"AGENT_DATABASE_MAX_CONNS", "0", "max_conns"},
+		{"AGENT_DATABASE_MAX_CONNS", "33", "max_conns"},
+		{"AGENT_DATABASE_MAX_CONNS", "invalid", "MAX_CONNS"},
+		{"AGENT_DATABASE_CONNECT_TIMEOUT", "0s", "connect_timeout"},
+	} {
+		t.Run(tc.key+"/"+tc.value, func(t *testing.T) {
+			values := map[string]string{"AGENT_DATABASE_ENABLED": "true", "AGENT_DATABASE_PASSWORD": "do-not-print-this"}
+			values[tc.key] = tc.value
+			_, err := load(writeFile(t, "agent.yaml", validYAML), "", environment(values))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %s error, got %v", tc.want, err)
+			}
+			if strings.Contains(err.Error(), "do-not-print-this") {
+				t.Fatal("secret leaked into validation error")
+			}
+		})
+	}
+}
+
 func environment(values map[string]string) func(string) (string, bool) {
 	return func(name string) (string, bool) {
 		value, ok := values[name]

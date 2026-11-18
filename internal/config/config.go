@@ -24,6 +24,7 @@ type Config struct {
 	ShutdownTimeout   time.Duration
 	HeartbeatInterval time.Duration
 	Telegram          Telegram
+	Database          Database
 }
 
 // Telegram keeps the token out of YAML and serialization.
@@ -31,6 +32,17 @@ type Telegram struct {
 	Enabled        bool
 	Token          string `json:"-" yaml:"-"`
 	AllowedUserIDs []int64
+}
+
+type Database struct {
+	Enabled        bool
+	Host           string
+	Port           uint16
+	Name           string
+	User           string
+	Password       string `json:"-" yaml:"-"`
+	ConnectTimeout time.Duration
+	MaxConns       int32
 }
 
 type fileConfig struct {
@@ -45,6 +57,15 @@ type fileConfig struct {
 		Enabled        bool    `yaml:"enabled"`
 		AllowedUserIDs []int64 `yaml:"allowed_user_ids"`
 	} `yaml:"telegram"`
+	Database struct {
+		Enabled        bool   `yaml:"enabled"`
+		Host           string `yaml:"host"`
+		Port           int    `yaml:"port"`
+		Name           string `yaml:"name"`
+		User           string `yaml:"user"`
+		ConnectTimeout string `yaml:"connect_timeout"`
+		MaxConns       int32  `yaml:"max_conns"`
+	} `yaml:"database"`
 }
 
 // Load applies settings in this order: YAML < optional .env < process environment.
@@ -61,6 +82,9 @@ func load(configPath, envPath string, lookup func(string) (string, bool)) (Confi
 	defer file.Close()
 
 	var raw fileConfig
+	raw.Database.Host, raw.Database.Port = "127.0.0.1", 5432
+	raw.Database.Name, raw.Database.User = "study_agent", "study_agent"
+	raw.Database.ConnectTimeout, raw.Database.MaxConns = "10s", 4
 	decoder := yaml.NewDecoder(file)
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&raw); err != nil {
@@ -81,11 +105,15 @@ func load(configPath, envPath string, lookup func(string) (string, bool)) (Confi
 	}
 
 	settings := map[string]*string{
-		"AGENT_LOG_LEVEL":          &raw.Log.Level,
-		"AGENT_LOG_FORMAT":         &raw.Log.Format,
-		"AGENT_TIMEZONE":           &raw.Timezone,
-		"AGENT_SHUTDOWN_TIMEOUT":   &raw.ShutdownTimeout,
-		"AGENT_HEARTBEAT_INTERVAL": &raw.HeartbeatInterval,
+		"AGENT_LOG_LEVEL":                &raw.Log.Level,
+		"AGENT_LOG_FORMAT":               &raw.Log.Format,
+		"AGENT_TIMEZONE":                 &raw.Timezone,
+		"AGENT_SHUTDOWN_TIMEOUT":         &raw.ShutdownTimeout,
+		"AGENT_HEARTBEAT_INTERVAL":       &raw.HeartbeatInterval,
+		"AGENT_DATABASE_HOST":            &raw.Database.Host,
+		"AGENT_DATABASE_NAME":            &raw.Database.Name,
+		"AGENT_DATABASE_USER":            &raw.Database.User,
+		"AGENT_DATABASE_CONNECT_TIMEOUT": &raw.Database.ConnectTimeout,
 	}
 	for name, target := range settings {
 		if value, ok := lookup(name); ok {
@@ -101,6 +129,25 @@ func load(configPath, envPath string, lookup func(string) (string, bool)) (Confi
 		}
 		v, ok := localEnv[name]
 		return v, ok
+	}
+	if enabled, ok := value("AGENT_DATABASE_ENABLED"); ok {
+		raw.Database.Enabled, err = strconv.ParseBool(enabled)
+		if err != nil {
+			return Config{}, errors.New("AGENT_DATABASE_ENABLED must be true or false")
+		}
+	}
+	if port, ok := value("AGENT_DATABASE_PORT"); ok {
+		raw.Database.Port, err = strconv.Atoi(port)
+		if err != nil {
+			return Config{}, errors.New("AGENT_DATABASE_PORT must be an integer between 1 and 65535")
+		}
+	}
+	if maxConns, ok := value("AGENT_DATABASE_MAX_CONNS"); ok {
+		n, parseErr := strconv.ParseInt(maxConns, 10, 32)
+		if parseErr != nil {
+			return Config{}, errors.New("AGENT_DATABASE_MAX_CONNS must be an integer between 1 and 32")
+		}
+		raw.Database.MaxConns = int32(n)
 	}
 	if enabled, ok := value("AGENT_TELEGRAM_ENABLED"); ok {
 		raw.Telegram.Enabled, err = strconv.ParseBool(enabled)
@@ -161,7 +208,35 @@ func load(configPath, envPath string, lookup func(string) (string, bool)) (Confi
 	if err := cfg.Telegram.Validate(); err != nil {
 		return Config{}, err
 	}
+	if raw.Database.Port < 1 || raw.Database.Port > 65535 {
+		return Config{}, errors.New("database.port must be between 1 and 65535")
+	}
+	cfg.Database = Database{Enabled: raw.Database.Enabled, Host: raw.Database.Host, Port: uint16(raw.Database.Port),
+		Name: raw.Database.Name, User: raw.Database.User, MaxConns: raw.Database.MaxConns}
+	cfg.Database.ConnectTimeout, err = positiveDuration("database.connect_timeout", raw.Database.ConnectTimeout)
+	if err != nil {
+		return Config{}, err
+	}
+	if password, ok := value("AGENT_DATABASE_PASSWORD"); ok {
+		cfg.Database.Password = password
+	}
+	if err := cfg.Database.Validate(); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+func (d Database) Validate() error {
+	if strings.TrimSpace(d.Host) == "" || strings.TrimSpace(d.Name) == "" || strings.TrimSpace(d.User) == "" {
+		return errors.New("database host, name and user must not be empty")
+	}
+	if d.Port == 0 || d.MaxConns < 1 || d.MaxConns > 32 || d.ConnectTimeout <= 0 {
+		return errors.New("database requires a valid port, positive connect_timeout and max_conns between 1 and 32")
+	}
+	if d.Enabled && d.Password == "" {
+		return errors.New("AGENT_DATABASE_PASSWORD is required when database is enabled")
+	}
+	return nil
 }
 
 var tokenPattern = regexp.MustCompile(`^[0-9]+:[A-Za-z0-9_-]+$`)

@@ -9,3 +9,12 @@ heartbeat_interval: 30s
 telegram:
   enabled: false
   allowed_user_ids: []
+
+database:
+  enabled: false
+  host: 127.0.0.1
+  port: 5432
+  name: study_agent
+  user: study_agent
+  connect_timeout: 10s
+  max_conns: 4
