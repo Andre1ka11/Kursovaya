@@ -11,6 +11,8 @@ import (
 
 	"study-agent/internal/app"
 	"study-agent/internal/config"
+	"study-agent/internal/service"
+	"study-agent/internal/telegram"
 )
 
 func main() {
@@ -42,7 +44,7 @@ func run() int {
 	logger := slog.New(handler).With("app", "study-agent")
 
 	if *checkConfig {
-		logger.Info("configuration valid", "config", *configPath, "timezone", cfg.Timezone.String())
+		logger.Info("configuration valid", "config", *configPath, "timezone", cfg.Timezone.String(), "telegram_enabled", cfg.Telegram.Enabled)
 		return 0
 	}
 
@@ -50,7 +52,16 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := app.New(cfg, logger).Run(ctx); err != nil {
+	var workers []app.Worker
+	if cfg.Telegram.Enabled {
+		client, err := telegram.New(cfg.Telegram, service.Commands{}, logger)
+		if err != nil {
+			logger.Error("cannot initialize Telegram bot", "error", err)
+			return 1
+		}
+		workers = append(workers, client)
+	}
+	if err := app.New(cfg, logger, workers...).Run(ctx); err != nil {
 		logger.Error("agent failed", "error", err)
 		return 1
 	}

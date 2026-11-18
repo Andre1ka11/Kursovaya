@@ -5,3 +5,7 @@ log:
 timezone: Europe/Moscow
 shutdown_timeout: 10s
 heartbeat_interval: 30s
+
+telegram:
+  enabled: false
+  allowed_user_ids: []

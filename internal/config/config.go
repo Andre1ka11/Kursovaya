@@ -7,6 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 	_ "time/tzdata" // Keep IANA time zones available in a standalone Windows build.
 
@@ -20,6 +23,14 @@ type Config struct {
 	Timezone          *time.Location
 	ShutdownTimeout   time.Duration
 	HeartbeatInterval time.Duration
+	Telegram          Telegram
+}
+
+// Telegram keeps the token out of YAML and serialization.
+type Telegram struct {
+	Enabled        bool
+	Token          string `json:"-" yaml:"-"`
+	AllowedUserIDs []int64
 }
 
 type fileConfig struct {
@@ -30,6 +41,10 @@ type fileConfig struct {
 	Timezone          string `yaml:"timezone"`
 	ShutdownTimeout   string `yaml:"shutdown_timeout"`
 	HeartbeatInterval string `yaml:"heartbeat_interval"`
+	Telegram          struct {
+		Enabled        bool    `yaml:"enabled"`
+		AllowedUserIDs []int64 `yaml:"allowed_user_ids"`
+	} `yaml:"telegram"`
 }
 
 // Load applies settings in this order: YAML < optional .env < process environment.
@@ -79,6 +94,32 @@ func load(configPath, envPath string, lookup func(string) (string, bool)) (Confi
 			*target = value
 		}
 	}
+	// Secrets use the same precedence, without changing os.Environ.
+	value := func(name string) (string, bool) {
+		if v, ok := lookup(name); ok {
+			return v, true
+		}
+		v, ok := localEnv[name]
+		return v, ok
+	}
+	if enabled, ok := value("AGENT_TELEGRAM_ENABLED"); ok {
+		raw.Telegram.Enabled, err = strconv.ParseBool(enabled)
+		if err != nil {
+			return Config{}, errors.New("AGENT_TELEGRAM_ENABLED must be true or false")
+		}
+	}
+	if ids, ok := value("AGENT_ALLOWED_USER_IDS"); ok {
+		raw.Telegram.AllowedUserIDs = nil
+		if strings.TrimSpace(ids) != "" {
+			for _, item := range strings.Split(ids, ",") {
+				id, parseErr := strconv.ParseInt(strings.TrimSpace(item), 10, 64)
+				if parseErr != nil {
+					return Config{}, errors.New("AGENT_ALLOWED_USER_IDS must contain positive numeric IDs separated by commas")
+				}
+				raw.Telegram.AllowedUserIDs = append(raw.Telegram.AllowedUserIDs, id)
+			}
+		}
+	}
 
 	var cfg Config
 	switch raw.Log.Level {
@@ -112,7 +153,37 @@ func load(configPath, envPath string, lookup func(string) (string, bool)) (Confi
 	if err != nil {
 		return Config{}, err
 	}
+	cfg.Telegram.Enabled = raw.Telegram.Enabled
+	cfg.Telegram.AllowedUserIDs = raw.Telegram.AllowedUserIDs
+	if token, ok := value("AGENT_BOT_TOKEN"); ok {
+		cfg.Telegram.Token = strings.TrimSpace(token)
+	}
+	if err := cfg.Telegram.Validate(); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+var tokenPattern = regexp.MustCompile(`^[0-9]+:[A-Za-z0-9_-]+$`)
+
+func (t Telegram) Validate() error {
+	if !t.Enabled {
+		return nil
+	}
+	if !tokenPattern.MatchString(t.Token) {
+		return errors.New("AGENT_BOT_TOKEN must contain a bot token from BotFather")
+	}
+	if len(t.AllowedUserIDs) == 0 {
+		return errors.New("telegram.allowed_user_ids or AGENT_ALLOWED_USER_IDS must contain at least one user ID")
+	}
+	seen := make(map[int64]bool)
+	for _, id := range t.AllowedUserIDs {
+		if id <= 0 || seen[id] {
+			return errors.New("Telegram user IDs must be positive and unique")
+		}
+		seen[id] = true
+	}
+	return nil
 }
 
 func positiveDuration(name, value string) (time.Duration, error) {

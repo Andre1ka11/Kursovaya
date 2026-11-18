@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -92,6 +93,60 @@ func TestLoadDoesNotExposeMalformedEnvContents(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "do-not-print-this") {
 		t.Fatal("error exposes the contents of the .env file")
+	}
+}
+
+func TestTelegramSettings(t *testing.T) {
+	path := writeFile(t, "agent.yaml", validYAML+"telegram:\n  enabled: false\n  allowed_user_ids: [7]\n")
+	envPath := writeFile(t, ".env", "AGENT_TELEGRAM_ENABLED=true\nAGENT_BOT_TOKEN=123:fake-token\nAGENT_ALLOWED_USER_IDS=42\n")
+	cfg, err := load(path, envPath, environment(map[string]string{"AGENT_ALLOWED_USER_IDS": "84, 85"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Telegram.Enabled || cfg.Telegram.Token != "123:fake-token" ||
+		len(cfg.Telegram.AllowedUserIDs) != 2 || cfg.Telegram.AllowedUserIDs[0] != 84 {
+		t.Fatal("Telegram settings did not respect environment precedence")
+	}
+	encoded, err := json.Marshal(cfg.Telegram)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), cfg.Telegram.Token) {
+		t.Fatal("token is included in serialized settings")
+	}
+}
+
+func TestTelegramRejectsInvalidSettings(t *testing.T) {
+	cases := []struct {
+		name  string
+		patch map[string]string
+		want  string
+	}{
+		{"missing token", map[string]string{"AGENT_BOT_TOKEN": ""}, "AGENT_BOT_TOKEN"},
+		{"invalid token", map[string]string{"AGENT_BOT_TOKEN": "do-not-print-this"}, "AGENT_BOT_TOKEN"},
+		{"empty allowlist", map[string]string{"AGENT_ALLOWED_USER_IDS": ""}, "allowed_user_ids"},
+		{"negative ID", map[string]string{"AGENT_ALLOWED_USER_IDS": "-42"}, "positive"},
+		{"zero ID", map[string]string{"AGENT_ALLOWED_USER_IDS": "0"}, "positive"},
+		{"duplicate ID", map[string]string{"AGENT_ALLOWED_USER_IDS": "42,42"}, "unique"},
+		{"non numeric ID", map[string]string{"AGENT_ALLOWED_USER_IDS": "andre"}, "numeric"},
+		{"invalid enable flag", map[string]string{"AGENT_TELEGRAM_ENABLED": "maybe"}, "true or false"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			values := map[string]string{
+				"AGENT_TELEGRAM_ENABLED": "true", "AGENT_BOT_TOKEN": "123:fake-token", "AGENT_ALLOWED_USER_IDS": "42",
+			}
+			for key, value := range tc.patch {
+				values[key] = value
+			}
+			_, err := load(writeFile(t, "agent.yaml", validYAML), "", environment(values))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q error, got %v", tc.want, err)
+			}
+			if strings.Contains(err.Error(), "do-not-print-this") {
+				t.Fatal("invalid token leaked into the error")
+			}
+		})
 	}
 }
 
